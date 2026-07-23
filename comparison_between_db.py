@@ -64,6 +64,12 @@ def round_amount(x, decimals=4):
 DIFF_TOLERANCE = 0.0001  # differences below this are treated as matches, not flagged
 
 
+def fmt_amount(v):
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    return f"{v:,.4f}"
+
+
 # ─────────────────────────────────────────
 # HELPER FUNCTIONS — cleaning / casting
 # ─────────────────────────────────────────
@@ -409,7 +415,8 @@ if st.session_state.summary["A"] and st.session_state.summary["B"]:
             st.metric("Total de registros", summary["total_records"])
             st.metric("Número de columnas", summary["num_columns"])
             if summary["number_sums"]:
-                st.write("**Suma por columna numérica:**", summary["number_sums"])
+                formatted_sums = {k: fmt_amount(v) for k, v in summary["number_sums"].items()}
+                st.write("**Suma por columna numérica:**", formatted_sums)
             if summary["date_distinct_counts"]:
                 st.write("**Conteo de fechas distintas:**", summary["date_distinct_counts"])
             if summary["string_distinct_counts"]:
@@ -511,7 +518,12 @@ if st.session_state.comparison is not None:
         return styles
 
     st.subheader("🔀 Comparación lado a lado")
-    st.dataframe(merged.style.apply(highlight_diff, axis=1), use_container_width=True)
+    styled = (
+        merged.style
+        .apply(highlight_diff, axis=1)
+        .format({sum_a: fmt_amount, sum_b: fmt_amount, "Diferencia": fmt_amount})
+    )
+    st.dataframe(styled, use_container_width=True)
 
     # ─────────────────────────────────────────
     # STEP 6 — PDF EXPORT
@@ -522,7 +534,9 @@ if st.session_state.comparison is not None:
         sa, sb = st.session_state.summary["A"], st.session_state.summary["B"]
         rows.append(["Total de registros", sa["total_records"], sb["total_records"]])
         rows.append(["Número de columnas", sa["num_columns"], sb["num_columns"]])
-        rows.append(["Suma por columna numérica", str(sa["number_sums"]), str(sb["number_sums"])])
+        rows.append(["Suma por columna numérica",
+                     str({k: fmt_amount(v) for k, v in sa["number_sums"].items()}),
+                     str({k: fmt_amount(v) for k, v in sb["number_sums"].items()})])
         rows.append(["Fechas distintas", str(sa["date_distinct_counts"]), str(sb["date_distinct_counts"])])
         rows.append(["Textos distintos", str(sa["string_distinct_counts"]), str(sb["string_distinct_counts"])])
         table = Table(rows, repeatRows=1, colWidths=[150, 250, 250])
@@ -577,7 +591,11 @@ if st.session_state.comparison is not None:
         elements.append(Spacer(1, 12))
 
         elements.append(Paragraph("Comparación agrupada", styles["Heading2"]))
-        data = [list(df.columns)] + df.astype(str).values.tolist()
+        display_df = df.copy()
+        for c in (sum_a, sum_b, "Diferencia"):
+            if c in display_df.columns:
+                display_df[c] = display_df[c].apply(fmt_amount)
+        data = [list(display_df.columns)] + display_df.astype(str).values.tolist()
         table = Table(data, repeatRows=1)
 
         style_cmds = [
