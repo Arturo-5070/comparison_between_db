@@ -54,6 +54,16 @@ def sum_col_name(colname, dataset_key):
     return f"sum_{short_col(colname)}_{dataset_key}"
 
 
+def round_amount(x, decimals=4):
+    """Round a numeric amount to a fixed number of decimal places, NaN-safe."""
+    if x is None or pd.isna(x):
+        return x
+    return round(float(x), decimals)
+
+
+DIFF_TOLERANCE = 0.0001  # differences below this are treated as matches, not flagged
+
+
 # ─────────────────────────────────────────
 # HELPER FUNCTIONS — cleaning / casting
 # ─────────────────────────────────────────
@@ -135,7 +145,7 @@ def parse_number_value(value, number_format=None):
         text = text.replace(",", "")
 
     try:
-        return float(text)
+        return round(float(text), 4)
     except ValueError:
         return NUMBER_DEFAULT
 
@@ -422,6 +432,7 @@ def group_and_sum(dataset_key, str_keys, date_keys, num_col, key_names):
     df = read_from_buffer(dataset_key)
     group_cols = list(str_keys) + list(date_keys)
     grouped = df.groupby(group_cols, as_index=False)[num_col].sum()
+    grouped[num_col] = grouped[num_col].apply(round_amount)
     sum_name = sum_col_name(num_col, dataset_key)
     grouped = grouped.rename(columns={num_col: sum_name})
     # key columns take dataset A's names (truncated), shared across A and B for alignment
@@ -448,7 +459,7 @@ if st.button("📐 Agrupar y comparar"):
             grouped_a, grouped_b, on=key_cols, how="outer"
         ).sort_values(by=key_cols, ascending=True).reset_index(drop=True)
 
-        merged["Diferencia"] = merged[sum_name_a] - merged[sum_name_b]
+        merged["Diferencia"] = (merged[sum_name_a] - merged[sum_name_b]).apply(round_amount)
         st.session_state.comparison = {
             "df": merged, "key_cols": key_cols,
             "sum_a": sum_name_a, "sum_b": sum_name_b,
@@ -466,7 +477,8 @@ if st.session_state.comparison is not None:
 
     def highlight_diff(row):
         styles = [""] * len(row)
-        mismatch = pd.isna(row.get(sum_a)) or pd.isna(row.get(sum_b)) or row.get(sum_a) != row.get(sum_b)
+        a, b = row.get(sum_a), row.get(sum_b)
+        mismatch = pd.isna(a) or pd.isna(b) or abs(a - b) >= DIFF_TOLERANCE
         if mismatch:
             styles = ["background-color: orange"] * len(row)
         return styles
@@ -496,23 +508,28 @@ if st.session_state.comparison is not None:
         ]))
         return table
 
-    def distribution_chart_image(dataset_key, str_col, num_col):
-        """Bar chart: sum(num_col) grouped by str_col, for one dataset."""
-        if not str_col or not num_col:
+    def distribution_charts_side_by_side(chart_specs):
+        """One combined image: dataset A and B bar charts side by side, with total labels on each bar."""
+        valid_specs = [(k, s, n) for k, s, n in chart_specs if s and n]
+        if not valid_specs:
             return None
-        df = read_from_buffer(dataset_key)
-        agg = df.groupby(str_col, as_index=False)[num_col].sum().sort_values(num_col, ascending=False).head(15)
-        fig, ax = plt.subplots(figsize=(6, 3))
-        ax.bar(agg[str_col].astype(str), agg[num_col], color="#4C72B0")
-        ax.set_title(f"{dataset_label(dataset_key)}: {num_col} por {str_col}", fontsize=9)
-        ax.tick_params(axis="x", rotation=75, labelsize=6)
-        ax.tick_params(axis="y", labelsize=7)
+        fig, axes = plt.subplots(1, len(valid_specs), figsize=(6 * len(valid_specs), 3.2))
+        if len(valid_specs) == 1:
+            axes = [axes]
+        for ax, (key, str_col, num_col) in zip(axes, valid_specs):
+            df = read_from_buffer(key)
+            agg = df.groupby(str_col, as_index=False)[num_col].sum().sort_values(num_col, ascending=False).head(10)
+            bars = ax.bar(agg[str_col].astype(str), agg[num_col], color="#4C72B0")
+            ax.bar_label(bars, fmt="%.4f", fontsize=6, rotation=90, padding=2)
+            ax.set_title(f"{dataset_label(key)}: {num_col} por {str_col}", fontsize=9)
+            ax.tick_params(axis="x", rotation=75, labelsize=6)
+            ax.tick_params(axis="y", labelsize=7)
         fig.tight_layout()
         img_buf = io.BytesIO()
         fig.savefig(img_buf, format="png", dpi=150)
         plt.close(fig)
         img_buf.seek(0)
-        return Image(img_buf, width=350, height=175)
+        return Image(img_buf, width=350 * len(valid_specs), height=180)
 
     def build_pdf(df, sum_a, sum_b, chart_specs):
         buffer = io.BytesIO()
@@ -525,11 +542,9 @@ if st.session_state.comparison is not None:
         elements.append(Spacer(1, 16))
 
         elements.append(Paragraph("Distribución de montos", styles["Heading2"]))
-        for key, str_col, num_col in chart_specs:
-            img = distribution_chart_image(key, str_col, num_col)
-            if img is not None:
-                elements.append(img)
-                elements.append(Spacer(1, 8))
+        chart_img = distribution_charts_side_by_side(chart_specs)
+        if chart_img is not None:
+            elements.append(chart_img)
         elements.append(Spacer(1, 12))
 
         elements.append(Paragraph("Comparación agrupada", styles["Heading2"]))
@@ -543,7 +558,8 @@ if st.session_state.comparison is not None:
             ("FONTSIZE", (0, 0), (-1, -1), 7),
         ]
         for i, row in df.iterrows():
-            mismatch = pd.isna(row.get(sum_a)) or pd.isna(row.get(sum_b)) or row.get(sum_a) != row.get(sum_b)
+            a, b = row.get(sum_a), row.get(sum_b)
+            mismatch = pd.isna(a) or pd.isna(b) or abs(a - b) >= DIFF_TOLERANCE
             if mismatch:
                 style_cmds.append(("BACKGROUND", (0, i + 1), (-1, i + 1), colors.orange))
 
