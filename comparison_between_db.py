@@ -23,7 +23,7 @@ st.set_page_config(page_title="Comparador de Datasets", layout="wide")
 # CONSTANTS
 # ─────────────────────────────────────────
 MAX_COLUMNS = 7
-MAX_ROWS_BUFFER = 1000000
+MAX_ROWS_BUFFER = 20000
 DATE_FORMATS = ["%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d"]
 DATE_DEFAULT = datetime(1950, 1, 1, tzinfo=timezone.utc)
 NUMBER_DEFAULT = 0.0
@@ -212,27 +212,54 @@ st.header("1️⃣ Carga de archivos")
 up_col1, up_col2 = st.columns(2)
 
 
-def load_raw(file):
-    if file is None:
-        return None
+def load_raw(file, sheet_name=None):
     if file.name.lower().endswith(".csv"):
         df = pd.read_csv(file, dtype=str, keep_default_na=False)
     else:
-        df = pd.read_excel(file, dtype=str)
+        df = pd.read_excel(file, dtype=str, sheet_name=sheet_name if sheet_name is not None else 0)
     return df.astype(str)
+
+
+def get_sheet_names(file):
+    if file.name.lower().endswith((".xlsx", ".xls")):
+        try:
+            xls = pd.ExcelFile(file)
+            file.seek(0)
+            return xls.sheet_names
+        except Exception:
+            return None
+    return None
 
 
 with up_col1:
     file_a = st.file_uploader("Dataset A", type=["csv", "xlsx", "xls"], key="uploader_A")
     if file_a is not None:
-        st.session_state.raw["A"] = load_raw(file_a)
         st.session_state.filenames["A"] = file_a.name
+        sheet_names_a = get_sheet_names(file_a)
+        sheet_a = None
+        if sheet_names_a:
+            sheet_a = (
+                st.selectbox("Hoja de Excel (A)", sheet_names_a, key="sheet_A")
+                if len(sheet_names_a) > 1 else sheet_names_a[0]
+            )
+        file_a.seek(0)
+        st.session_state.raw["A"] = load_raw(file_a, sheet_a)
 
 with up_col2:
     file_b = st.file_uploader("Dataset B", type=["csv", "xlsx", "xls"], key="uploader_B")
     if file_b is not None:
-        st.session_state.raw["B"] = load_raw(file_b)
         st.session_state.filenames["B"] = file_b.name
+        sheet_names_b = get_sheet_names(file_b)
+        sheet_b = None
+        if sheet_names_b:
+            sheet_b = (
+                st.selectbox("Hoja de Excel (B)", sheet_names_b, key="sheet_B")
+                if len(sheet_names_b) > 1 else sheet_names_b[0]
+            )
+        file_b.seek(0)
+        st.session_state.raw["B"] = load_raw(file_b, sheet_b)
+
+st.caption("📄 Para archivos Excel con varias hojas, elige la hoja a usar; se carga solo una hoja por archivo.")
 
 if st.session_state.raw["A"] is None or st.session_state.raw["B"] is None:
     st.info("Sube ambos archivos para continuar.")
@@ -520,10 +547,12 @@ if st.session_state.comparison is not None:
             df = read_from_buffer(key)
             agg = df.groupby(str_col, as_index=False)[num_col].sum().sort_values(num_col, ascending=False).head(10)
             bars = ax.bar(agg[str_col].astype(str), agg[num_col], color="#4C72B0")
-            ax.bar_label(bars, fmt="%.4f", fontsize=6, rotation=90, padding=2)
+            labels = [f"{v:,.4f}" for v in agg[num_col]]
+            ax.bar_label(bars, labels=labels, fontsize=6, rotation=0, padding=2)
             ax.set_title(f"{dataset_label(key)}: {num_col} por {str_col}", fontsize=9)
             ax.tick_params(axis="x", rotation=75, labelsize=6)
             ax.tick_params(axis="y", labelsize=7)
+            ax.margins(y=0.15)
         fig.tight_layout()
         img_buf = io.BytesIO()
         fig.savefig(img_buf, format="png", dpi=150)
