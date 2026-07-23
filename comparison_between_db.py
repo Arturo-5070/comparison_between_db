@@ -25,6 +25,7 @@ st.set_page_config(page_title="Comparador de Datasets", layout="wide")
 MAX_COLUMNS = 7
 MAX_ROWS_BUFFER = 20000
 DATE_FORMATS = ["%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d"]
+CSV_SEPARATORS = {"Coma (,)": ",", "Punto y coma (;)": ";", "Barra vertical (|)": "|", "Tabulador": "\t", "Auto-detectar": None}
 DATE_DEFAULT = datetime(1950, 1, 1, tzinfo=timezone.utc)
 NUMBER_DEFAULT = 0.0
 STRING_DEFAULT = "(Default)"
@@ -218,9 +219,12 @@ st.header("1️⃣ Carga de archivos")
 up_col1, up_col2 = st.columns(2)
 
 
-def load_raw(file, sheet_name=None):
+def load_raw(file, sheet_name=None, sep=None):
     if file.name.lower().endswith(".csv"):
-        df = pd.read_csv(file, dtype=str, keep_default_na=False)
+        if sep is None:
+            df = pd.read_csv(file, dtype=str, keep_default_na=False, sep=None, engine="python")
+        else:
+            df = pd.read_csv(file, dtype=str, keep_default_na=False, sep=sep)
     else:
         df = pd.read_excel(file, dtype=str, sheet_name=sheet_name if sheet_name is not None else 0)
     return df.astype(str)
@@ -241,31 +245,41 @@ with up_col1:
     file_a = st.file_uploader("Dataset A", type=["csv", "xlsx", "xls"], key="uploader_A")
     if file_a is not None:
         st.session_state.filenames["A"] = file_a.name
-        sheet_names_a = get_sheet_names(file_a)
-        sheet_a = None
-        if sheet_names_a:
-            sheet_a = (
-                st.selectbox("Hoja de Excel (A)", sheet_names_a, key="sheet_A")
-                if len(sheet_names_a) > 1 else sheet_names_a[0]
-            )
-        file_a.seek(0)
-        st.session_state.raw["A"] = load_raw(file_a, sheet_a)
+        if file_a.name.lower().endswith(".csv"):
+            sep_label_a = st.selectbox("Separador CSV (A)", list(CSV_SEPARATORS.keys()), key="sep_A")
+            file_a.seek(0)
+            st.session_state.raw["A"] = load_raw(file_a, sep=CSV_SEPARATORS[sep_label_a])
+        else:
+            sheet_names_a = get_sheet_names(file_a)
+            sheet_a = None
+            if sheet_names_a:
+                sheet_a = (
+                    st.selectbox("Hoja de Excel (A)", sheet_names_a, key="sheet_A")
+                    if len(sheet_names_a) > 1 else sheet_names_a[0]
+                )
+            file_a.seek(0)
+            st.session_state.raw["A"] = load_raw(file_a, sheet_name=sheet_a)
 
 with up_col2:
     file_b = st.file_uploader("Dataset B", type=["csv", "xlsx", "xls"], key="uploader_B")
     if file_b is not None:
         st.session_state.filenames["B"] = file_b.name
-        sheet_names_b = get_sheet_names(file_b)
-        sheet_b = None
-        if sheet_names_b:
-            sheet_b = (
-                st.selectbox("Hoja de Excel (B)", sheet_names_b, key="sheet_B")
-                if len(sheet_names_b) > 1 else sheet_names_b[0]
-            )
-        file_b.seek(0)
-        st.session_state.raw["B"] = load_raw(file_b, sheet_b)
+        if file_b.name.lower().endswith(".csv"):
+            sep_label_b = st.selectbox("Separador CSV (B)", list(CSV_SEPARATORS.keys()), key="sep_B")
+            file_b.seek(0)
+            st.session_state.raw["B"] = load_raw(file_b, sep=CSV_SEPARATORS[sep_label_b])
+        else:
+            sheet_names_b = get_sheet_names(file_b)
+            sheet_b = None
+            if sheet_names_b:
+                sheet_b = (
+                    st.selectbox("Hoja de Excel (B)", sheet_names_b, key="sheet_B")
+                    if len(sheet_names_b) > 1 else sheet_names_b[0]
+                )
+            file_b.seek(0)
+            st.session_state.raw["B"] = load_raw(file_b, sheet_name=sheet_b)
 
-st.caption("📄 Para archivos Excel con varias hojas, elige la hoja a usar; se carga solo una hoja por archivo.")
+st.caption("📄 Para archivos Excel con varias hojas, elige la hoja a usar; se carga solo una hoja por archivo. Para CSV, elige el separador o deja \"Auto-detectar\".")
 
 if st.session_state.raw["A"] is None or st.session_state.raw["B"] is None:
     st.info("Sube ambos archivos para continuar.")
@@ -275,6 +289,38 @@ if st.session_state.raw["A"] is None or st.session_state.raw["B"] is None:
 # STEP 2 & 3 — COLUMN SELECTION + TYPE TAGGING
 # ─────────────────────────────────────────
 st.header("2️⃣ Selección de columnas (máx. 7) y tipo de dato")
+
+
+def sniff_type_and_format(series, sample_size=50):
+    """Heuristic sniffing (similar spirit to csv.Sniffer) to suggest a type/format for a column."""
+    sample = series.dropna().astype(str).str.strip()
+    sample = sample[sample != ""]
+    sample = sample.head(sample_size)
+    if sample.empty:
+        return "String", None, None
+
+    for fmt in DATE_FORMATS:
+        matches = 0
+        for v in sample:
+            try:
+                datetime.strptime(v, fmt)
+                matches += 1
+            except ValueError:
+                pass
+        if matches / len(sample) >= 0.8:
+            return "Date", fmt, None
+
+    numeric_pattern = re.compile(r"^-?[\d.,]+$")
+    numeric_matches = sum(1 for v in sample if numeric_pattern.match(v))
+    if numeric_matches / len(sample) >= 0.8:
+        hint = None
+        for v in sample:
+            if "," in v and "." in v:
+                hint = "1.234,56" if v.rfind(",") > v.rfind(".") else "1,234.56"
+                break
+        return "Number", None, hint
+
+    return "String", None, None
 
 
 def column_config_ui(dataset_key):
@@ -292,9 +338,18 @@ def column_config_ui(dataset_key):
     col_config = {}
     for col in selected_cols:
         st.markdown(f"**Columna: `{col}`**")
+
+        suggested_type, suggested_fmt, suggested_num_hint = sniff_type_and_format(df[col])
+        st.caption(
+            f"🔎 Sugerencia detectada: **{suggested_type}**"
+            + (f" (formato: `{suggested_fmt}`)" if suggested_fmt else "")
+            + (f" (formato numérico: `{suggested_num_hint}`)" if suggested_num_hint else "")
+        )
+
         col_type = st.radio(
             f"Tipo de dato para `{col}` ({dataset_key})",
             TYPE_OPTIONS,
+            index=TYPE_OPTIONS.index(suggested_type),
             key=f"type_{dataset_key}_{col}",
             horizontal=True,
         )
@@ -302,9 +357,12 @@ def column_config_ui(dataset_key):
         entry = {"type": col_type}
 
         if col_type == "Date":
+            date_radio_options = DATE_FORMATS + ["Ninguno de los anteriores (personalizado)"]
+            default_index = DATE_FORMATS.index(suggested_fmt) if suggested_fmt in DATE_FORMATS else len(DATE_FORMATS)
             fmt_choice = st.radio(
                 f"Formato de fecha para `{col}`",
-                DATE_FORMATS + ["Ninguno de los anteriores (personalizado)"],
+                date_radio_options,
+                index=default_index,
                 key=f"datefmt_{dataset_key}_{col}",
                 horizontal=True,
             )
@@ -326,6 +384,7 @@ def column_config_ui(dataset_key):
             )
             number_format = st.text_input(
                 f"Formato de número de referencia para `{col}` (ej. 1,234.56 o 1.234,56)",
+                value=suggested_num_hint or "",
                 key=f"numfmt_{dataset_key}_{col}",
             )
             entry["convert"] = convert
