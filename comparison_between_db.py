@@ -1,4 +1,5 @@
 import io
+import os
 import re
 import uuid
 import unicodedata
@@ -9,8 +10,12 @@ import streamlit as st
 from pymongo import MongoClient
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import landscape, letter
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
 from reportlab.lib.styles import getSampleStyleSheet
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 st.set_page_config(page_title="Comparador de Datasets", layout="wide")
 
@@ -18,11 +23,36 @@ st.set_page_config(page_title="Comparador de Datasets", layout="wide")
 # CONSTANTS
 # ─────────────────────────────────────────
 MAX_COLUMNS = 7
+MAX_ROWS_BUFFER = 1000000
 DATE_FORMATS = ["%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d"]
 DATE_DEFAULT = datetime(1950, 1, 1, tzinfo=timezone.utc)
 NUMBER_DEFAULT = 0.0
 STRING_DEFAULT = "(Default)"
 TYPE_OPTIONS = ["String", "Date", "Number"]
+NAME_MAXLEN = 11   # dataset display-name truncation
+COL_MAXLEN = 7      # grouping/sum column-name truncation
+
+# ─────────────────────────────────────────
+# HELPER FUNCTIONS — naming
+# ─────────────────────────────────────────
+def dataset_label(dataset_key):
+    """Filename (no extension), truncated to NAME_MAXLEN, always suffixed _A/_B."""
+    filename = st.session_state.filenames.get(dataset_key) or f"Dataset{dataset_key}"
+    base = os.path.splitext(filename)[0]
+    if len(base) > NAME_MAXLEN:
+        base = base[:NAME_MAXLEN]
+    return f"{base}_{dataset_key}"
+
+
+def short_col(name):
+    """Column name truncated to COL_MAXLEN (no suffix — used for shared key columns)."""
+    return name[:COL_MAXLEN] if len(name) > COL_MAXLEN else name
+
+
+def sum_col_name(colname, dataset_key):
+    """sum_<colname trunc to 7>_A / _B"""
+    return f"sum_{short_col(colname)}_{dataset_key}"
+
 
 # ─────────────────────────────────────────
 # HELPER FUNCTIONS — cleaning / casting
@@ -49,6 +79,17 @@ def parse_date_value(value, fmt=None, custom_regex=None):
             dt = datetime.strptime(text, fmt)
         except ValueError:
             dt = None
+            # Fallback: the file may carry the date in a different literal
+            # shape than the chosen format (e.g. Excel auto-parsed it to
+            # "2024-05-13 00:00:00"). Let pandas infer it, respecting the
+            # day/month order implied by the format the user picked.
+            dayfirst = fmt.startswith("%d")
+            try:
+                parsed = pd.to_datetime(text, dayfirst=dayfirst, errors="coerce")
+                if not pd.isna(parsed):
+                    dt = parsed.to_pydatetime()
+            except Exception:
+                dt = None
 
     if dt is None and custom_regex:
         match = re.search(custom_regex, text)
@@ -149,6 +190,8 @@ if "grouped" not in st.session_state:
     st.session_state.grouped = {"A": None, "B": None}
 if "comparison" not in st.session_state:
     st.session_state.comparison = None
+if "filenames" not in st.session_state:
+    st.session_state.filenames = {"A": None, "B": None}
 
 st.title("🔍 Comparador de Datasets (Streamlit + MongoDB buffer)")
 
@@ -173,11 +216,13 @@ with up_col1:
     file_a = st.file_uploader("Dataset A", type=["csv", "xlsx", "xls"], key="uploader_A")
     if file_a is not None:
         st.session_state.raw["A"] = load_raw(file_a)
+        st.session_state.filenames["A"] = file_a.name
 
 with up_col2:
     file_b = st.file_uploader("Dataset B", type=["csv", "xlsx", "xls"], key="uploader_B")
     if file_b is not None:
         st.session_state.raw["B"] = load_raw(file_b)
+        st.session_state.filenames["B"] = file_b.name
 
 if st.session_state.raw["A"] is None or st.session_state.raw["B"] is None:
     st.info("Sube ambos archivos para continuar.")
@@ -191,10 +236,11 @@ st.header("2️⃣ Selección de columnas (máx. 7) y tipo de dato")
 
 def column_config_ui(dataset_key):
     df = st.session_state.raw[dataset_key]
-    st.subheader(f"Dataset {dataset_key}")
+    label = dataset_label(dataset_key)
+    st.subheader(label)
 
     selected_cols = st.multiselect(
-        f"Columnas a conservar ({dataset_key}) — máximo {MAX_COLUMNS}",
+        f"Columnas a conservar ({label}) — máximo {MAX_COLUMNS}",
         options=list(df.columns),
         max_selections=MAX_COLUMNS,
         key=f"select_cols_{dataset_key}",
@@ -284,11 +330,11 @@ def process_dataset(dataset_key, selected_cols):
     return out
 
 
-def build_summary(dataset_key, processed_df):
+def build_summary(dataset_key, processed_df, original_col_count):
     config = st.session_state.config[dataset_key]
     summary = {
         "total_records": len(processed_df),
-        "num_columns": len(processed_df.columns),
+        "num_columns": original_col_count,
         "number_sums": {},
         "date_distinct_counts": {},
         "string_distinct_counts": {},
@@ -310,23 +356,27 @@ if st.button("🚀 Procesar y cargar ambos datasets al buffer de MongoDB"):
         for key, sel in (("A", sel_a), ("B", sel_b)):
             processed = process_dataset(key, sel)
             st.session_state.processed[key] = processed
-            push_to_buffer(key, processed)
-            st.session_state.summary[key] = build_summary(key, processed)
+            original_col_count = st.session_state.raw[key].shape[1]
+            st.session_state.summary[key] = build_summary(key, processed, original_col_count)
+            push_to_buffer(key, processed.head(MAX_ROWS_BUFFER))
         st.success("Datos procesados y cargados al buffer.")
 
-for key in ("A", "B"):
-    summary = st.session_state.summary[key]
-    if summary:
-        st.subheader(f"📊 Resumen — Dataset {key}")
-        m1, m2 = st.columns(2)
-        m1.metric("Total de registros", summary["total_records"])
-        m2.metric("Número de columnas", summary["num_columns"])
-        if summary["number_sums"]:
-            st.write("**Suma por columna numérica:**", summary["number_sums"])
-        if summary["date_distinct_counts"]:
-            st.write("**Conteo de fechas distintas:**", summary["date_distinct_counts"])
-        if summary["string_distinct_counts"]:
-            st.write("**Conteo de textos distintos:**", summary["string_distinct_counts"])
+st.caption(f"⚠️ Esta versión limita la carga al buffer de MongoDB a las primeras {MAX_ROWS_BUFFER:,} filas y {MAX_COLUMNS} columnas por dataset. Las estadísticas de resumen (arriba) reflejan el dataset completo; la agrupación/comparación usa solo las filas cargadas al buffer.")
+
+if st.session_state.summary["A"] and st.session_state.summary["B"]:
+    sum_col1, sum_col2 = st.columns(2)
+    for key, col in (("A", sum_col1), ("B", sum_col2)):
+        summary = st.session_state.summary[key]
+        with col:
+            st.subheader(f"📊 Resumen — {dataset_label(key)}")
+            st.metric("Total de registros", summary["total_records"])
+            st.metric("Número de columnas", summary["num_columns"])
+            if summary["number_sums"]:
+                st.write("**Suma por columna numérica:**", summary["number_sums"])
+            if summary["date_distinct_counts"]:
+                st.write("**Conteo de fechas distintas:**", summary["date_distinct_counts"])
+            if summary["string_distinct_counts"]:
+                st.write("**Conteo de textos distintas:**", summary["string_distinct_counts"])
 
 if st.session_state.processed["A"] is None or st.session_state.processed["B"] is None:
     st.stop()
@@ -350,7 +400,7 @@ def cols_by_type(dataset_key, col_type):
 g1, g2 = st.columns(2)
 
 with g1:
-    st.markdown("**Dataset A**")
+    st.markdown(f"**{dataset_label('A')}**")
     str_keys_a = date_keys_a = []
     if group_mode in ("Solo texto (strings)", "Ambos combinados"):
         str_keys_a = st.multiselect("Columnas de texto para agrupar (A)", cols_by_type("A", "String"), key="gstr_a")
@@ -359,7 +409,7 @@ with g1:
     num_col_a = st.selectbox("Columna numérica a sumar (A)", cols_by_type("A", "Number"), key="gnum_a")
 
 with g2:
-    st.markdown("**Dataset B**")
+    st.markdown(f"**{dataset_label('B')}**")
     str_keys_b = date_keys_b = []
     if group_mode in ("Solo texto (strings)", "Ambos combinados"):
         str_keys_b = st.multiselect("Columnas de texto para agrupar (B)", cols_by_type("B", "String"), key="gstr_b")
@@ -368,17 +418,18 @@ with g2:
     num_col_b = st.selectbox("Columna numérica a sumar (B)", cols_by_type("B", "Number"), key="gnum_b")
 
 
-def group_and_sum(dataset_key, str_keys, date_keys, num_col):
+def group_and_sum(dataset_key, str_keys, date_keys, num_col, key_names):
     df = read_from_buffer(dataset_key)
     group_cols = list(str_keys) + list(date_keys)
     grouped = df.groupby(group_cols, as_index=False)[num_col].sum()
-    grouped = grouped.rename(columns={num_col: "Sum"})
-    # rename group columns to generic Key_n for cross-dataset alignment
-    rename_map = {c: f"Key_{i+1}" for i, c in enumerate(group_cols)}
+    sum_name = sum_col_name(num_col, dataset_key)
+    grouped = grouped.rename(columns={num_col: sum_name})
+    # key columns take dataset A's names (truncated), shared across A and B for alignment
+    rename_map = {c: key_names[i] for i, c in enumerate(group_cols)}
     grouped = grouped.rename(columns=rename_map)
     key_cols = list(rename_map.values())
     grouped = grouped.sort_values(by=key_cols, ascending=True).reset_index(drop=True)
-    return grouped, key_cols
+    return grouped, key_cols, sum_name
 
 
 if st.button("📐 Agrupar y comparar"):
@@ -389,23 +440,33 @@ if st.button("📐 Agrupar y comparar"):
     elif len(keys_a) != len(keys_b):
         st.error("El número de columnas de agrupación debe coincidir entre A y B para poder alinear.")
     else:
-        grouped_a, key_cols = group_and_sum("A", str_keys_a, date_keys_a, num_col_a)
-        grouped_b, _ = group_and_sum("B", str_keys_b, date_keys_b, num_col_b)
+        key_names = [short_col(c) for c in keys_a]  # names come from dataset A
+        grouped_a, key_cols, sum_name_a = group_and_sum("A", str_keys_a, date_keys_a, num_col_a, key_names)
+        grouped_b, _, sum_name_b = group_and_sum("B", str_keys_b, date_keys_b, num_col_b, key_names)
 
         merged = pd.merge(
-            grouped_a, grouped_b, on=key_cols, how="outer", suffixes=("_A", "_B")
+            grouped_a, grouped_b, on=key_cols, how="outer"
         ).sort_values(by=key_cols, ascending=True).reset_index(drop=True)
 
-        merged["Diferencia"] = merged["Sum_A"] - merged["Sum_B"]
-        st.session_state.comparison = {"df": merged, "key_cols": key_cols}
+        merged["Diferencia"] = merged[sum_name_a] - merged[sum_name_b]
+        st.session_state.comparison = {
+            "df": merged, "key_cols": key_cols,
+            "sum_a": sum_name_a, "sum_b": sum_name_b,
+            "str_a": str_keys_a[0] if str_keys_a else None,
+            "num_a": num_col_a,
+            "str_b": str_keys_b[0] if str_keys_b else None,
+            "num_b": num_col_b,
+        }
         st.session_state.grouped = {"A": grouped_a, "B": grouped_b}
 
 if st.session_state.comparison is not None:
-    merged = st.session_state.comparison["df"]
+    comp = st.session_state.comparison
+    merged = comp["df"]
+    sum_a, sum_b = comp["sum_a"], comp["sum_b"]
 
     def highlight_diff(row):
         styles = [""] * len(row)
-        mismatch = pd.isna(row.get("Sum_A")) or pd.isna(row.get("Sum_B")) or row.get("Sum_A") != row.get("Sum_B")
+        mismatch = pd.isna(row.get(sum_a)) or pd.isna(row.get(sum_b)) or row.get(sum_a) != row.get(sum_b)
         if mismatch:
             styles = ["background-color: orange"] * len(row)
         return styles
@@ -416,12 +477,62 @@ if st.session_state.comparison is not None:
     # ─────────────────────────────────────────
     # STEP 6 — PDF EXPORT
     # ─────────────────────────────────────────
-    def build_pdf(df):
+    def summary_table_flowable(styles):
+        """Two-column (A | B) summary block, same layout as the on-screen view."""
+        rows = [["Métrica", dataset_label("A"), dataset_label("B")]]
+        sa, sb = st.session_state.summary["A"], st.session_state.summary["B"]
+        rows.append(["Total de registros", sa["total_records"], sb["total_records"]])
+        rows.append(["Número de columnas", sa["num_columns"], sb["num_columns"]])
+        rows.append(["Suma por columna numérica", str(sa["number_sums"]), str(sb["number_sums"])])
+        rows.append(["Fechas distintas", str(sa["date_distinct_counts"]), str(sb["date_distinct_counts"])])
+        rows.append(["Textos distintos", str(sa["string_distinct_counts"]), str(sb["string_distinct_counts"])])
+        table = Table(rows, repeatRows=1, colWidths=[150, 250, 250])
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#333333")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]))
+        return table
+
+    def distribution_chart_image(dataset_key, str_col, num_col):
+        """Bar chart: sum(num_col) grouped by str_col, for one dataset."""
+        if not str_col or not num_col:
+            return None
+        df = read_from_buffer(dataset_key)
+        agg = df.groupby(str_col, as_index=False)[num_col].sum().sort_values(num_col, ascending=False).head(15)
+        fig, ax = plt.subplots(figsize=(6, 3))
+        ax.bar(agg[str_col].astype(str), agg[num_col], color="#4C72B0")
+        ax.set_title(f"{dataset_label(dataset_key)}: {num_col} por {str_col}", fontsize=9)
+        ax.tick_params(axis="x", rotation=75, labelsize=6)
+        ax.tick_params(axis="y", labelsize=7)
+        fig.tight_layout()
+        img_buf = io.BytesIO()
+        fig.savefig(img_buf, format="png", dpi=150)
+        plt.close(fig)
+        img_buf.seek(0)
+        return Image(img_buf, width=350, height=175)
+
+    def build_pdf(df, sum_a, sum_b, chart_specs):
         buffer = io.BytesIO()
         doc = SimpleDocTemplate(buffer, pagesize=landscape(letter))
         styles = getSampleStyleSheet()
         elements = [Paragraph("Comparación de Datasets", styles["Title"]), Spacer(1, 12)]
 
+        elements.append(Paragraph("Resumen por dataset", styles["Heading2"]))
+        elements.append(summary_table_flowable(styles))
+        elements.append(Spacer(1, 16))
+
+        elements.append(Paragraph("Distribución de montos", styles["Heading2"]))
+        for key, str_col, num_col in chart_specs:
+            img = distribution_chart_image(key, str_col, num_col)
+            if img is not None:
+                elements.append(img)
+                elements.append(Spacer(1, 8))
+        elements.append(Spacer(1, 12))
+
+        elements.append(Paragraph("Comparación agrupada", styles["Heading2"]))
         data = [list(df.columns)] + df.astype(str).values.tolist()
         table = Table(data, repeatRows=1)
 
@@ -432,7 +543,7 @@ if st.session_state.comparison is not None:
             ("FONTSIZE", (0, 0), (-1, -1), 7),
         ]
         for i, row in df.iterrows():
-            mismatch = pd.isna(row.get("Sum_A")) or pd.isna(row.get("Sum_B")) or row.get("Sum_A") != row.get("Sum_B")
+            mismatch = pd.isna(row.get(sum_a)) or pd.isna(row.get(sum_b)) or row.get(sum_a) != row.get(sum_b)
             if mismatch:
                 style_cmds.append(("BACKGROUND", (0, i + 1), (-1, i + 1), colors.orange))
 
@@ -442,7 +553,11 @@ if st.session_state.comparison is not None:
         buffer.seek(0)
         return buffer
 
-    pdf_buffer = build_pdf(merged)
+    chart_specs = [
+        ("A", comp["str_a"], comp["num_a"]),
+        ("B", comp["str_b"], comp["num_b"]),
+    ]
+    pdf_buffer = build_pdf(merged, sum_a, sum_b, chart_specs)
     st.download_button(
         "📄 Descargar comparación en PDF",
         data=pdf_buffer,
@@ -456,7 +571,7 @@ if st.session_state.comparison is not None:
 st.header("5️⃣ Finalizar")
 if st.button("🗑️ Borrar buffer de MongoDB y reiniciar"):
     clear_all_buffers()
-    for key in ("raw", "config", "processed", "summary", "grouped"):
+    for key in ("raw", "config", "processed", "summary", "grouped", "filenames"):
         st.session_state[key] = {"A": None, "B": None} if key != "config" else {"A": {}, "B": {}}
     st.session_state.comparison = None
     st.success("Buffer eliminado. Puedes cargar nuevos archivos.")
