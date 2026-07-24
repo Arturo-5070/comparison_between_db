@@ -636,6 +636,7 @@ if st.session_state.comparison is not None:
     def build_pdf(df, sum_a, sum_b, chart_specs):
         buffer = io.BytesIO()
         doc = SimpleDocTemplate(buffer, pagesize=landscape(letter))
+        doc.author = "https://www.linkedin.com/in/asotov/"
         styles = getSampleStyleSheet()
         elements = [Paragraph("Comparación de Datasets", styles["Title"]), Spacer(1, 12)]
 
