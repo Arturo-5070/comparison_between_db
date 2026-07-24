@@ -526,14 +526,19 @@ def group_and_sum(dataset_key, str_keys, date_keys, num_col, key_names):
     group_cols = list(str_keys) + list(date_keys)
     grouped = df.groupby(group_cols, as_index=False)[num_col].sum()
     grouped[num_col] = grouped[num_col].apply(round_amount)
+    counts = df.groupby(group_cols, as_index=False).size().rename(columns={"size": "count"})
+    grouped = grouped.merge(counts, on=group_cols)
+
     sum_name = sum_col_name(num_col, dataset_key)
-    grouped = grouped.rename(columns={num_col: sum_name})
+    count_name = f"count_{short_col(num_col)}_{dataset_key}"
+    grouped = grouped.rename(columns={num_col: sum_name, "count": count_name})
+
     # key columns take dataset A's names (truncated), shared across A and B for alignment
     rename_map = {c: key_names[i] for i, c in enumerate(group_cols)}
     grouped = grouped.rename(columns=rename_map)
     key_cols = list(rename_map.values())
     grouped = grouped.sort_values(by=key_cols, ascending=True).reset_index(drop=True)
-    return grouped, key_cols, sum_name
+    return grouped, key_cols, sum_name, count_name
 
 
 if st.button("📐 Agrupar y comparar"):
@@ -545,17 +550,19 @@ if st.button("📐 Agrupar y comparar"):
         st.error("El número de columnas de agrupación debe coincidir entre A y B para poder alinear.")
     else:
         key_names = [short_col(c) for c in keys_a]  # names come from dataset A
-        grouped_a, key_cols, sum_name_a = group_and_sum("A", str_keys_a, date_keys_a, num_col_a, key_names)
-        grouped_b, _, sum_name_b = group_and_sum("B", str_keys_b, date_keys_b, num_col_b, key_names)
+        grouped_a, key_cols, sum_name_a, count_name_a = group_and_sum("A", str_keys_a, date_keys_a, num_col_a, key_names)
+        grouped_b, _, sum_name_b, count_name_b = group_and_sum("B", str_keys_b, date_keys_b, num_col_b, key_names)
 
         merged = pd.merge(
             grouped_a, grouped_b, on=key_cols, how="outer"
         ).sort_values(by=key_cols, ascending=True).reset_index(drop=True)
 
         merged["Diferencia"] = (merged[sum_name_a] - merged[sum_name_b]).apply(round_amount)
+        merged = merged[key_cols + [sum_name_a, sum_name_b, "Diferencia", count_name_a, count_name_b]]
         st.session_state.comparison = {
             "df": merged, "key_cols": key_cols,
             "sum_a": sum_name_a, "sum_b": sum_name_b,
+            "count_a": count_name_a, "count_b": count_name_b,
             "str_a": str_keys_a[0] if str_keys_a else None,
             "num_a": num_col_a,
             "str_b": str_keys_b[0] if str_keys_b else None,
@@ -580,7 +587,10 @@ if st.session_state.comparison is not None:
     styled = (
         merged.style
         .apply(highlight_diff, axis=1)
-        .format({sum_a: fmt_amount, sum_b: fmt_amount, "Diferencia": fmt_amount})
+        .format({
+            sum_a: fmt_amount, sum_b: fmt_amount, "Diferencia": fmt_amount,
+            comp["count_a"]: "{:,}", comp["count_b"]: "{:,}",
+        })
     )
     st.dataframe(styled, use_container_width=True)
 
@@ -633,7 +643,7 @@ if st.session_state.comparison is not None:
         img_buf.seek(0)
         return Image(img_buf, width=350 * len(valid_specs), height=180)
 
-    def build_pdf(df, sum_a, sum_b, chart_specs):
+    def build_pdf(df, sum_a, sum_b, count_a, count_b, chart_specs):
         buffer = io.BytesIO()
         doc = SimpleDocTemplate(buffer, pagesize=landscape(letter))
         doc.author = "https://www.linkedin.com/in/asotov/"
@@ -655,6 +665,9 @@ if st.session_state.comparison is not None:
         for c in (sum_a, sum_b, "Diferencia"):
             if c in display_df.columns:
                 display_df[c] = display_df[c].apply(fmt_amount)
+        for c in (count_a, count_b):
+            if c in display_df.columns:
+                display_df[c] = display_df[c].apply(lambda v: f"{v:,}" if pd.notna(v) else "")
         data = [list(display_df.columns)] + display_df.astype(str).values.tolist()
         table = Table(data, repeatRows=1)
 
@@ -680,7 +693,7 @@ if st.session_state.comparison is not None:
         ("A", comp["str_a"], comp["num_a"]),
         ("B", comp["str_b"], comp["num_b"]),
     ]
-    pdf_buffer = build_pdf(merged, sum_a, sum_b, chart_specs)
+    pdf_buffer = build_pdf(merged, sum_a, sum_b, comp["count_a"], comp["count_b"], chart_specs)
     st.download_button(
         "📄 Descargar comparación en PDF",
         data=pdf_buffer,
